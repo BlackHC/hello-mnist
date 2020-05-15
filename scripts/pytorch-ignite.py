@@ -29,13 +29,41 @@ from torch.optim import SGD
 from torchvision.datasets import MNIST
 from torchvision.transforms import Compose, ToTensor, Normalize
 
-from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator
+from ignite.engine import Events, create_supervised_trainer, create_supervised_evaluator, Engine
 from ignite.metrics import Accuracy, Loss
 from ignite.contrib.handlers.tensorboard_logger import *
-from ignite.contrib.engines.common import setup_common_training_handlers, setup_tb_logging, add_early_stopping_by_val_score
-
+from ignite.contrib.engines.common import setup_common_training_handlers, setup_tb_logging, \
+    add_early_stopping_by_val_score
 
 LOG_INTERVAL = 10
+HEAVY_LOG_INTERVAL = 100
+
+
+# From https://tinyurl.com/pytorch-fast-mnist
+class FastMNIST(MNIST):
+    def __init__(self, device, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # Scale data to [0,1]
+        self.data = self.data.unsqueeze(1).float().div(255)
+
+        # Normalize it with the usual MNIST mean and std
+        self.data = self.data.sub_(0.1307).div_(0.3081)
+
+        # Put both data and targets on GPU in advance
+        self.data, self.targets = self.data.to(device), self.targets.to(device)
+
+    def __getitem__(self, index):
+        """
+        Args:
+            index (int): Index
+
+        Returns:
+            tuple: (image, target) where target is index of the target class.
+        """
+        img, target = self.data[index], self.targets[index]
+
+        return img, target
 
 
 class Net(nn.Module):
@@ -64,26 +92,27 @@ class Net(nn.Module):
         return output
 
 
-def get_data_loaders(train_batch_size, val_batch_size):
-    data_transform = Compose([ToTensor(), Normalize((0.1307,), (0.3081,))])
-
+def get_data_loaders(train_batch_size, val_batch_size, device):
     train_loader = DataLoader(
-        MNIST(download=True, root="data", transform=data_transform, train=True), batch_size=train_batch_size, shuffle=True
+        FastMNIST(device, download=True, root="data", train=True), batch_size=train_batch_size,
+        shuffle=True
     )
 
     val_loader = DataLoader(
-        MNIST(download=False, root="data", transform=data_transform, train=False), batch_size=val_batch_size, shuffle=False
+        FastMNIST(device, download=False, root="data", train=False), batch_size=val_batch_size,
+        shuffle=False
     )
     return train_loader, val_loader
 
 
 def run(train_batch_size, val_batch_size, epochs, lr, momentum, log_dir):
-    train_loader, val_loader = get_data_loaders(train_batch_size, val_batch_size)
-    model = Net()
     device = "cpu"
 
     if torch.cuda.is_available():
         device = "cuda"
+
+    train_loader, val_loader = get_data_loaders(train_batch_size, val_batch_size, device)
+    model = Net()
 
     model.to(device)  # Move model before creating optimizer
     optimizer = SGD(model.parameters(), lr=lr, momentum=momentum)
@@ -100,42 +129,60 @@ def run(train_batch_size, val_batch_size, epochs, lr, momentum, log_dir):
         train_evaluator.run(train_loader)
         validation_evaluator.run(val_loader)
 
-    setup_common_training_handlers(trainer)
-    tb_logger = setup_tb_logging(None, trainer, optimizer, dict(training=train_evaluator, validation=validation_evaluator))
+    setup_common_training_handlers(trainer, log_every_iters=LOG_INTERVAL)
 
-    # tb_logger = TensorboardLogger(log_dir=log_dir)
-    #
-    # tb_logger.attach(
-    #     trainer,
-    #     log_handler=OutputHandler(
-    #         tag="training", output_transform=lambda loss: {"batchloss": loss}, metric_names="all"
-    #     ),
-    #     event_name=Events.ITERATION_COMPLETED(every=100),
-    # )
-    #
-    # tb_logger.attach(
-    #     train_evaluator,
-    #     log_handler=OutputHandler(tag="training", metric_names=["loss", "accuracy"], another_engine=trainer),
-    #     event_name=Events.EPOCH_COMPLETED,
-    # )
-    #
-    # tb_logger.attach(
-    #     validation_evaluator,
-    #     log_handler=OutputHandler(tag="validation", metric_names=["loss", "accuracy"], another_engine=trainer),
-    #     event_name=Events.EPOCH_COMPLETED,
-    # )
-    #
-    # tb_logger.attach(
-    #     trainer, log_handler=OptimizerParamsHandler(optimizer), event_name=Events.ITERATION_COMPLETED(every=100)
-    # )
+    tb_logger = TensorboardLogger(log_dir=log_dir)
 
-    tb_logger.attach(trainer, log_handler=WeightsScalarHandler(model), event_name=Events.ITERATION_COMPLETED(every=100))
+    def global_step_transform(_, __):
+        return trainer.state.iteration
 
-    tb_logger.attach(trainer, log_handler=WeightsHistHandler(model), event_name=Events.ITERATION_COMPLETED(every=100))
+    # Compared to the default tb_logger behavior it is better to log everything using a single step counter
+    # and log epoch numbers separately.
+    tb_logger.attach(
+        trainer,
+        log_handler=lambda engine, logger, event_name: logger.writer.add_scalar("epoch", engine.state.epoch,
+                                                                                engine.state.iteration),
+        event_name=Events.ITERATION_COMPLETED(every=LOG_INTERVAL),
+    )
 
-    tb_logger.attach(trainer, log_handler=GradsScalarHandler(model), event_name=Events.ITERATION_COMPLETED(every=100))
+    # Log trainer metrics
+    tb_logger.attach(
+        trainer,
+        log_handler=OutputHandler(
+            tag="training", output_transform=lambda loss: {"batchloss": loss}, metric_names="all",
+            global_step_transform=global_step_transform
+        ),
+        event_name=Events.ITERATION_COMPLETED(every=LOG_INTERVAL),
+    )
 
-    tb_logger.attach(trainer, log_handler=GradsHistHandler(model), event_name=Events.ITERATION_COMPLETED(every=100))
+    # Log train evaluator metrics.
+    tb_logger.attach(
+        train_evaluator,
+        log_handler=OutputHandler(tag="training", metric_names="all", global_step_transform=global_step_transform),
+        event_name=Events.EPOCH_COMPLETED,
+    )
+
+    # Log validation evaluator metrics.
+    tb_logger.attach(
+        validation_evaluator,
+        log_handler=OutputHandler(tag="validation", metric_names="all", global_step_transform=global_step_transform),
+        event_name=Events.EPOCH_COMPLETED,
+    )
+
+    # Log optimizer metrics.
+    tb_logger.attach(
+        trainer, log_handler=OptimizerParamsHandler(optimizer), event_name=Events.ITERATION_COMPLETED(every=100)
+    )
+
+    # Log weights and gradients.
+    tb_logger.attach(trainer, log_handler=WeightsScalarHandler(model),
+                     event_name=Events.ITERATION_COMPLETED(every=HEAVY_LOG_INTERVAL))
+    tb_logger.attach(trainer, log_handler=WeightsHistHandler(model),
+                     event_name=Events.ITERATION_COMPLETED(every=HEAVY_LOG_INTERVAL))
+    tb_logger.attach(trainer, log_handler=GradsScalarHandler(model),
+                     event_name=Events.ITERATION_COMPLETED(every=HEAVY_LOG_INTERVAL))
+    tb_logger.attach(trainer, log_handler=GradsHistHandler(model),
+                     event_name=Events.ITERATION_COMPLETED(every=HEAVY_LOG_INTERVAL))
 
     # Add early stopping
     add_early_stopping_by_val_score(3, train_evaluator, trainer, "accuracy")
