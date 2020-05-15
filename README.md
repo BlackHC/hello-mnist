@@ -1,6 +1,6 @@
 # Hello MNIST
 
-Pytorch MNIST implementations using pure PyTorch, PyTorch Ignite and PyTorch Lightning.
+Pytorch MNIST implementations using pure [PyTorch](https://pytorch.org/), [PyTorch Ignite](https://pytorch.org/ignite/) and [PyTorch Lightning](https://pytorch-lightning.readthedocs.io/en/stable/).
 As scripts, Jupyter Notebooks and Google Colabs.
 
 ## Scripts
